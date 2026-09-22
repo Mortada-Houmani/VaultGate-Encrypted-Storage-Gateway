@@ -1,0 +1,14 @@
+# AWS Region to deploy resources
+aws_region = "eu-central-1"
+
+# Deployment environment: dev, staging, prod
+environment = "dev"
+
+# Project identifier prefix
+project_name = "vaultgate"
+
+# Enable CloudTrail trail for auditing
+enable_cloudtrail = true
+
+# LocalStack endpoint (leave empty for real AWS deployment)
+# localstack_endpoint = "http://localhost:4566"
