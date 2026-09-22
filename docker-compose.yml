@@ -5,7 +5,7 @@ services:
     ports:
       - "4566:4566"
     environment:
-      - SERVICES=s3,kms,cloudtrail
+      - LOCALSTACK_AUTH_TOKEN=${LOCALSTACK_AUTH_TOKEN:-}
       - AWS_DEFAULT_REGION=eu-central-1
       - DOCKER_HOST=unix:///var/run/docker.sock
     volumes:
