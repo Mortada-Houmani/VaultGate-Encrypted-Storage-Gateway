@@ -130,6 +130,28 @@ func (m *MockS3Client) HeadBucket(ctx context.Context, params *s3.HeadBucketInpu
 	return &s3.HeadBucketOutput{}, nil
 }
 
+func (m *MockS3Client) CopyObject(ctx context.Context, params *s3.CopyObjectInput, optFns ...func(*s3.Options)) (*s3.CopyObjectOutput, error) {
+	key := *params.Key
+	obj, exists := m.objects[key]
+	if !exists {
+		return nil, &s3types.NoSuchKey{
+			Message: aws.String("The specified key does not exist."),
+		}
+	}
+
+	metaCopy := make(map[string]string)
+	for k, v := range params.Metadata {
+		metaCopy[k] = v
+	}
+
+	m.objects[key] = &mockS3Object{
+		data:     obj.data,
+		metadata: metaCopy,
+	}
+
+	return &s3.CopyObjectOutput{}, nil
+}
+
 func TestS3Storage_PutAndGet_RoundTrip(t *testing.T) {
 	mockClient := NewMockS3Client()
 	storage := NewS3Storage(mockClient, "test-vaultgate-bucket")
@@ -359,5 +381,56 @@ func TestS3Storage_ErrorMapping(t *testing.T) {
 	err = storage.CheckHealth(ctx)
 	if !errors.Is(err, ErrObjectNotFound) {
 		t.Errorf("expected ErrObjectNotFound for missing bucket, got: %v", err)
+	}
+}
+
+func TestS3Storage_UpdateEnvelopeMetadata(t *testing.T) {
+	mockClient := NewMockS3Client()
+	storage := NewS3Storage(mockClient, "test-bucket")
+	ctx := context.Background()
+
+	env := &envelope.EncryptedEnvelope{
+		ObjectID:         "doc-update-meta",
+		Ciphertext:       []byte("stable-ciphertext-never-changed"),
+		IV:               []byte("123456789012"),
+		AuthTag:          []byte("1234567890123456"),
+		EncryptedDataKey: []byte("wrapped-key-v1"),
+		KMSKeyID:         "arn:aws:kms:us-east-1:123456789012:key/key-v1",
+		CreatedAt:        time.Now().UTC(),
+	}
+
+	if err := storage.PutEncryptedObject(ctx, env); err != nil {
+		t.Fatalf("Put failed: %v", err)
+	}
+
+	// Update metadata (e.g. after KMS ReWrap to key-v2)
+	updatedEnv := &envelope.EncryptedEnvelope{
+		ObjectID:         "doc-update-meta",
+		S3Key:            "objects/doc-update-meta",
+		IV:               env.IV,
+		AuthTag:          env.AuthTag,
+		EncryptedDataKey: []byte("wrapped-key-v2-re-encrypted"),
+		KMSKeyID:         "arn:aws:kms:us-east-1:123456789012:key/key-v2",
+		CreatedAt:        env.CreatedAt,
+	}
+
+	if err := storage.UpdateEnvelopeMetadata(ctx, updatedEnv); err != nil {
+		t.Fatalf("UpdateEnvelopeMetadata failed: %v", err)
+	}
+
+	// Retrieve object and assert that ciphertext is preserved and metadata is updated
+	recovered, err := storage.GetEncryptedObject(ctx, "doc-update-meta")
+	if err != nil {
+		t.Fatalf("GetEncryptedObject failed: %v", err)
+	}
+
+	if !bytes.Equal(recovered.Ciphertext, []byte("stable-ciphertext-never-changed")) {
+		t.Errorf("Ciphertext was altered during metadata update! Got %s", string(recovered.Ciphertext))
+	}
+	if recovered.KMSKeyID != "arn:aws:kms:us-east-1:123456789012:key/key-v2" {
+		t.Errorf("expected KMSKeyID key-v2, got %s", recovered.KMSKeyID)
+	}
+	if !bytes.Equal(recovered.EncryptedDataKey, []byte("wrapped-key-v2-re-encrypted")) {
+		t.Errorf("expected updated data key, got %s", string(recovered.EncryptedDataKey))
 	}
 }

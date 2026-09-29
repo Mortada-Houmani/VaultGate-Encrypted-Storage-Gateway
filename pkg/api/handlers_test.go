@@ -85,6 +85,45 @@ func (m *MockKMSForAPI) Decrypt(ctx context.Context, params *kms.DecryptInput, o
 	}, nil
 }
 
+func (m *MockKMSForAPI) ReEncrypt(ctx context.Context, params *kms.ReEncryptInput, optFns ...func(*kms.Options)) (*kms.ReEncryptOutput, error) {
+	if m.denyDecrypt {
+		return nil, &mockSmithyErr{code: "AccessDeniedException", message: "User is not authorized to perform: kms:ReEncrypt"}
+	}
+
+	blob := params.CiphertextBlob
+	if len(blob) < 28 {
+		return nil, &mockSmithyErr{code: "InvalidCiphertextException", message: "Ciphertext is malformed"}
+	}
+
+	iv := blob[:12]
+	tag := blob[12:28]
+	ct := blob[28:]
+	aad := []byte(params.SourceEncryptionContext["object_id"])
+
+	plainKey, err := crypto.Decrypt(ct, m.masterKey, iv, tag, aad)
+	if err != nil {
+		return nil, &mockSmithyErr{code: "InvalidCiphertextException", message: "Context mismatch or integrity failure"}
+	}
+
+	newIV, _ := crypto.GenerateIV()
+	destAAD := []byte(params.DestinationEncryptionContext["object_id"])
+	newCT, newTag, err := crypto.Encrypt(plainKey, m.masterKey, newIV, destAAD)
+	if err != nil {
+		return nil, err
+	}
+
+	newBlob := append(newIV, append(newTag, newCT...)...)
+	destKeyID := m.keyID
+	if params.DestinationKeyId != nil {
+		destKeyID = *params.DestinationKeyId
+	}
+
+	return &kms.ReEncryptOutput{
+		KeyId:          aws.String(destKeyID),
+		CiphertextBlob: newBlob,
+	}, nil
+}
+
 type mockSmithyErr struct {
 	code    string
 	message string
@@ -163,6 +202,24 @@ func (m *MockS3ForAPI) HeadObject(ctx context.Context, params *s3.HeadObjectInpu
 
 func (m *MockS3ForAPI) HeadBucket(ctx context.Context, params *s3.HeadBucketInput, optFns ...func(*s3.Options)) (*s3.HeadBucketOutput, error) {
 	return &s3.HeadBucketOutput{}, nil
+}
+
+func (m *MockS3ForAPI) CopyObject(ctx context.Context, params *s3.CopyObjectInput, optFns ...func(*s3.Options)) (*s3.CopyObjectOutput, error) {
+	obj, exists := m.objects[*params.Key]
+	if !exists {
+		return nil, &s3types.NoSuchKey{
+			Message: aws.String("The specified key does not exist."),
+		}
+	}
+	metaCopy := make(map[string]string)
+	for k, v := range params.Metadata {
+		metaCopy[k] = v
+	}
+	m.objects[*params.Key] = &mockS3Obj{
+		data:     obj.data,
+		metadata: metaCopy,
+	}
+	return &s3.CopyObjectOutput{}, nil
 }
 
 // setupTestServer wires together the mock KMS, mock S3 storage, and API router for testing.
@@ -513,5 +570,139 @@ func TestAPI_CORS_Options(t *testing.T) {
 	}
 	if resp.Header.Get("Access-Control-Allow-Origin") != "*" {
 		t.Errorf("expected Access-Control-Allow-Origin: *, got %s", resp.Header.Get("Access-Control-Allow-Origin"))
+	}
+}
+
+func TestAPI_KeyRotation_BackwardCompatibility(t *testing.T) {
+	mockKMS := NewMockKMSForAPI("arn:aws:kms:us-east-1:123456789012:key/master-key-v1")
+	envService := envelope.NewService(mockKMS, "arn:aws:kms:us-east-1:123456789012:key/master-key-v1")
+	mockS3 := NewMockS3ForAPI()
+	s3Storage := storage.NewS3Storage(mockS3, "vaultgate-test-bucket")
+
+	gw := NewGatewayService(envService, s3Storage)
+	handler := NewHandler(gw)
+	router := NewRouter(handler)
+
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+	client := server.Client()
+
+	// 1. Upload object under Key V1
+	v1Payload := []byte("Medical Records: Patient #4412")
+	upReq, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/objects?id=patient-4412", bytes.NewReader(v1Payload))
+	upResp, err := client.Do(upReq)
+	if err != nil || upResp.StatusCode != http.StatusCreated {
+		t.Fatalf("v1 upload failed: %v", err)
+	}
+	upResp.Body.Close()
+
+	// 2. SIMULATE MASTER KEY ROTATION: Gateway rotates active key to Key V2
+	keyV2 := "arn:aws:kms:us-east-1:123456789012:key/master-key-v2"
+	gw.RotateMasterKey(keyV2)
+	mockKMS.keyID = keyV2
+
+	if gw.ActiveKMSKeyID() != keyV2 {
+		t.Fatalf("expected active key to be %s, got %s", keyV2, gw.ActiveKMSKeyID())
+	}
+
+	// 3. Upload a new object under Key V2
+	v2Payload := []byte("Medical Records: Patient #4413")
+	upReq2, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/objects?id=patient-4413", bytes.NewReader(v2Payload))
+	upResp2, err := client.Do(upReq2)
+	if err != nil || upResp2.StatusCode != http.StatusCreated {
+		t.Fatalf("v2 upload failed: %v", err)
+	}
+	upResp2.Body.Close()
+
+	// 4. Download BOTH objects: V1 object (created under old key) and V2 object must decrypt seamlessly
+	getV1, err := client.Get(server.URL + "/api/v1/objects/patient-4412")
+	if err != nil || getV1.StatusCode != http.StatusOK {
+		t.Fatalf("downloading V1 object under rotated key failed: %v, status %d", err, getV1.StatusCode)
+	}
+	dataV1, _ := io.ReadAll(getV1.Body)
+	getV1.Body.Close()
+	if !bytes.Equal(dataV1, v1Payload) {
+		t.Errorf("v1 payload mismatch: got %s, want %s", string(dataV1), string(v1Payload))
+	}
+
+	getV2, err := client.Get(server.URL + "/api/v1/objects/patient-4413")
+	if err != nil || getV2.StatusCode != http.StatusOK {
+		t.Fatalf("downloading V2 object failed: %v", err)
+	}
+	dataV2, _ := io.ReadAll(getV2.Body)
+	getV2.Body.Close()
+	if !bytes.Equal(dataV2, v2Payload) {
+		t.Errorf("v2 payload mismatch: got %s, want %s", string(dataV2), string(v2Payload))
+	}
+}
+
+func TestAPI_ReWrap_Endpoint(t *testing.T) {
+	server, _, s3Storage := setupTestServer(t)
+	client := server.Client()
+
+	// 1. Upload object
+	originalPlaintext := []byte("Trade Secret: Quantum-Safe Hash Engine Specs")
+	upReq, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/objects?id=quantum-specs", bytes.NewReader(originalPlaintext))
+	upResp, err := client.Do(upReq)
+	if err != nil || upResp.StatusCode != http.StatusCreated {
+		t.Fatalf("upload failed: %v", err)
+	}
+	upResp.Body.Close()
+
+	// Capture initial raw ciphertext
+	ctx := context.Background()
+	initialEnv, err := s3Storage.GetEncryptedObject(ctx, "quantum-specs")
+	if err != nil {
+		t.Fatalf("failed to fetch initial env: %v", err)
+	}
+
+	// 2. Call POST /api/v1/objects/{id}/rewrap to re-encrypt the data key under new master key
+	newMasterKey := "arn:aws:kms:us-east-1:123456789012:key/master-key-rotated-v2"
+	reWrapBody, _ := json.Marshal(ReWrapRequest{NewKMSKeyID: newMasterKey})
+	reWrapReq, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/objects/quantum-specs/rewrap", bytes.NewReader(reWrapBody))
+	reWrapReq.Header.Set("Content-Type", "application/json")
+
+	reWrapResp, err := client.Do(reWrapReq)
+	if err != nil {
+		t.Fatalf("rewrap request failed: %v", err)
+	}
+	defer reWrapResp.Body.Close()
+
+	if reWrapResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(reWrapResp.Body)
+		t.Fatalf("expected 200 OK for rewrap, got %d: %s", reWrapResp.StatusCode, string(b))
+	}
+
+	var res ReWrapResponse
+	if err := json.NewDecoder(reWrapResp.Body).Decode(&res); err != nil {
+		t.Fatalf("failed to decode rewrap response: %v", err)
+	}
+
+	if res.NewKMSKeyID != newMasterKey {
+		t.Errorf("expected new KMS key ID %s, got %s", newMasterKey, res.NewKMSKeyID)
+	}
+
+	// 3. Verify in S3: Ciphertext payload was NOT modified, metadata header WAS updated
+	afterEnv, err := s3Storage.GetEncryptedObject(ctx, "quantum-specs")
+	if err != nil {
+		t.Fatalf("failed to fetch env after rewrap: %v", err)
+	}
+	if !bytes.Equal(afterEnv.Ciphertext, initialEnv.Ciphertext) {
+		t.Error("Ciphertext payload was modified during server-side re-wrapping!")
+	}
+	if afterEnv.KMSKeyID != newMasterKey {
+		t.Errorf("expected S3 KMS Key ID header to be updated to %s, got %s", newMasterKey, afterEnv.KMSKeyID)
+	}
+
+	// 4. Verify object downloads and decrypts perfectly
+	getResp, err := client.Get(server.URL + "/api/v1/objects/quantum-specs")
+	if err != nil || getResp.StatusCode != http.StatusOK {
+		t.Fatalf("download after rewrap failed: %v", err)
+	}
+	decrypted, _ := io.ReadAll(getResp.Body)
+	getResp.Body.Close()
+
+	if !bytes.Equal(decrypted, originalPlaintext) {
+		t.Errorf("decrypted content mismatch: got %s, want %s", string(decrypted), string(originalPlaintext))
 	}
 }

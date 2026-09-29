@@ -56,6 +56,7 @@ type S3API interface {
 	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 	HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
 	HeadBucket(ctx context.Context, params *s3.HeadBucketInput, optFns ...func(*s3.Options)) (*s3.HeadBucketOutput, error)
+	CopyObject(ctx context.Context, params *s3.CopyObjectInput, optFns ...func(*s3.Options)) (*s3.CopyObjectOutput, error)
 }
 
 // Storage is the interface for persisting and retrieving encrypted envelope objects.
@@ -64,6 +65,7 @@ type Storage interface {
 	GetEncryptedObject(ctx context.Context, objectID string) (*envelope.EncryptedEnvelope, error)
 	DeleteEncryptedObject(ctx context.Context, objectID string) error
 	HeadEncryptedObject(ctx context.Context, objectID string) (int64, error)
+	UpdateEnvelopeMetadata(ctx context.Context, env *envelope.EncryptedEnvelope) error
 	CheckHealth(ctx context.Context) error
 	BucketName() string
 }
@@ -234,6 +236,45 @@ func (s *S3Storage) HeadEncryptedObject(ctx context.Context, objectID string) (i
 		return *output.ContentLength, nil
 	}
 	return 0, nil
+}
+
+// UpdateEnvelopeMetadata updates the S3 object metadata headers in-place (e.g. after KMS ReWrap)
+// using S3 CopyObject with MetadataDirective: REPLACE.
+func (s *S3Storage) UpdateEnvelopeMetadata(ctx context.Context, env *envelope.EncryptedEnvelope) error {
+	if env == nil || env.ObjectID == "" {
+		return fmt.Errorf("%w: envelope or object ID is nil", envelope.ErrInvalidEnvelope)
+	}
+
+	metadata := map[string]string{
+		MetaKeyIV:           hex.EncodeToString(env.IV),
+		MetaKeyAuthTag:      hex.EncodeToString(env.AuthTag),
+		MetaKeyEncryptedKey: base64.StdEncoding.EncodeToString(env.EncryptedDataKey),
+		MetaKeyKMSKeyID:     env.KMSKeyID,
+		MetaKeyObjectID:     env.ObjectID,
+		MetaKeyAlgorithm:    AlgorithmAES256GCM,
+		MetaKeyCreatedAt:    env.CreatedAt.UTC().Format(time.RFC3339Nano),
+	}
+
+	s3Key := env.S3Key
+	if s3Key == "" {
+		s3Key = fmt.Sprintf("objects/%s", env.ObjectID)
+	}
+
+	copySource := fmt.Sprintf("%s/%s", s.bucket, s3Key)
+	input := &s3.CopyObjectInput{
+		Bucket:            aws.String(s.bucket),
+		Key:               aws.String(s3Key),
+		CopySource:        aws.String(copySource),
+		Metadata:          metadata,
+		MetadataDirective: s3types.MetadataDirectiveReplace,
+	}
+
+	_, err := s.client.CopyObject(ctx, input)
+	if err != nil {
+		return s.mapS3Error(err)
+	}
+
+	return nil
 }
 
 // CheckHealth verifies connectivity to the S3 bucket.

@@ -122,6 +122,60 @@ func (m *MockKMSClient) Decrypt(ctx context.Context, params *kms.DecryptInput, o
 	}, nil
 }
 
+func (m *MockKMSClient) ReEncrypt(ctx context.Context, params *kms.ReEncryptInput, optFns ...func(*kms.Options)) (*kms.ReEncryptOutput, error) {
+	if !m.AllowDecrypt {
+		return nil, &smithy.GenericAPIError{
+			Code:    "AccessDeniedException",
+			Message: "User is not authorized to perform: kms:ReEncrypt",
+		}
+	}
+
+	record, exists := m.storedKeys[string(params.CiphertextBlob)]
+	if !exists {
+		return nil, &smithy.GenericAPIError{
+			Code:    "InvalidCiphertextException",
+			Message: "The ciphertext references a key that does not exist or cannot be decrypted.",
+		}
+	}
+
+	// Verify cryptographic context binding on source
+	for k, expectedVal := range record.context {
+		actualVal, ok := params.SourceEncryptionContext[k]
+		if !ok || actualVal != expectedVal {
+			return nil, &smithy.GenericAPIError{
+				Code:    "InvalidCiphertextException",
+				Message: fmt.Sprintf("SourceEncryptionContext mismatch for key '%s'", k),
+			}
+		}
+	}
+
+	// Create new synthetic wrapped blob under the destination key
+	newCiphertextBlob := make([]byte, 48)
+	if _, err := rand.Read(newCiphertextBlob); err != nil {
+		return nil, fmt.Errorf("mock: failed to generate new blob: %w", err)
+	}
+
+	destContext := make(map[string]string)
+	for k, v := range params.DestinationEncryptionContext {
+		destContext[k] = v
+	}
+
+	m.storedKeys[string(newCiphertextBlob)] = storedKey{
+		plaintextKey: record.plaintextKey,
+		context:      destContext,
+	}
+
+	destKeyID := m.MasterKeyID
+	if params.DestinationKeyId != nil {
+		destKeyID = *params.DestinationKeyId
+	}
+
+	return &kms.ReEncryptOutput{
+		KeyId:          aws.String(destKeyID),
+		CiphertextBlob: newCiphertextBlob,
+	}, nil
+}
+
 func TestEnvelope_RoundTrip(t *testing.T) {
 	masterKey := "arn:aws:kms:eu-central-1:772607727749:key/vaultgate-master"
 	mockKMS := NewMockKMSClient(masterKey)
@@ -258,4 +312,103 @@ func TestEnvelope_InvalidInputs(t *testing.T) {
 			t.Fatalf("Expected ErrInvalidEnvelope, got: %v", err)
 		}
 	})
+}
+
+// TestEnvelope_KeyRotation_BackwardCompatibility proves that rotating the KMS master key
+// allows existing objects created under older key versions to decrypt transparently.
+func TestEnvelope_KeyRotation_BackwardCompatibility(t *testing.T) {
+	keyV1 := "arn:aws:kms:us-east-1:123456789012:key/master-key-v1"
+	keyV2 := "arn:aws:kms:us-east-1:123456789012:key/master-key-v2"
+
+	mockKMS := NewMockKMSClient(keyV1)
+	service := NewService(mockKMS, keyV1)
+	ctx := context.Background()
+
+	// 1. Encrypt object under Key V1
+	dataV1 := []byte("Archived records from 2025")
+	envV1, err := service.WrapAndEncrypt(ctx, "record-2025", dataV1)
+	if err != nil {
+		t.Fatalf("Wrap under V1 failed: %v", err)
+	}
+
+	// 2. SIMULATE KMS ROTATION: Service active key rotates to V2
+	service.SetKMSKeyID(keyV2)
+	mockKMS.MasterKeyID = keyV2
+
+	if service.KMSKeyID() != keyV2 {
+		t.Fatalf("expected active key to be %s, got %s", keyV2, service.KMSKeyID())
+	}
+
+	// 3. Encrypt new object under Key V2
+	dataV2 := []byte("New active records from 2026")
+	envV2, err := service.WrapAndEncrypt(ctx, "record-2026", dataV2)
+	if err != nil {
+		t.Fatalf("Wrap under V2 failed: %v", err)
+	}
+
+	// 4. Decrypt BOTH objects transparently without re-encryption
+	decryptedV1, err := service.DecryptAndUnwrap(ctx, envV1)
+	if err != nil {
+		t.Fatalf("Decrypting V1 object under rotated service failed: %v", err)
+	}
+	if !bytes.Equal(decryptedV1, dataV1) {
+		t.Errorf("V1 data mismatch: got %s, want %s", string(decryptedV1), string(dataV1))
+	}
+
+	decryptedV2, err := service.DecryptAndUnwrap(ctx, envV2)
+	if err != nil {
+		t.Fatalf("Decrypting V2 object failed: %v", err)
+	}
+	if !bytes.Equal(decryptedV2, dataV2) {
+		t.Errorf("V2 data mismatch: got %s, want %s", string(decryptedV2), string(dataV2))
+	}
+}
+
+// TestEnvelope_ReWrap proves that re-encrypting a wrapped data key via KMS ReEncrypt
+// successfully updates the envelope without decrypting or altering the ciphertext blob.
+func TestEnvelope_ReWrap(t *testing.T) {
+	keyV1 := "arn:aws:kms:us-east-1:123456789012:key/master-key-v1"
+	keyV2 := "arn:aws:kms:us-east-1:123456789012:key/master-key-v2"
+
+	mockKMS := NewMockKMSClient(keyV1)
+	service := NewService(mockKMS, keyV1)
+	ctx := context.Background()
+
+	originalData := []byte("Confidential Student Transcript")
+	envV1, err := service.WrapAndEncrypt(ctx, "student-1001", originalData)
+	if err != nil {
+		t.Fatalf("Initial wrap failed: %v", err)
+	}
+
+	oldCiphertext := make([]byte, len(envV1.Ciphertext))
+	copy(oldCiphertext, envV1.Ciphertext)
+
+	// Re-wrap the envelope under Key V2
+	envV2, err := service.ReWrapEnvelope(ctx, envV1, keyV2)
+	if err != nil {
+		t.Fatalf("ReWrapEnvelope failed: %v", err)
+	}
+
+	// Assertions:
+	// 1. Ciphertext remains byte-identical (no streaming / re-encryption of payload)
+	if !bytes.Equal(envV2.Ciphertext, oldCiphertext) {
+		t.Error("Ciphertext was modified during ReWrap! Expected it to remain untouched.")
+	}
+	// 2. KMSKeyID is updated to keyV2
+	if envV2.KMSKeyID != keyV2 {
+		t.Errorf("expected KMSKeyID %s, got %s", keyV2, envV2.KMSKeyID)
+	}
+	// 3. EncryptedDataKey is updated
+	if bytes.Equal(envV2.EncryptedDataKey, envV1.EncryptedDataKey) {
+		t.Error("Expected EncryptedDataKey to be re-wrapped, but it is identical to old key blob")
+	}
+
+	// 4. Decrypting the re-wrapped envelope produces original plaintext
+	decrypted, err := service.DecryptAndUnwrap(ctx, envV2)
+	if err != nil {
+		t.Fatalf("Decrypt after rewrap failed: %v", err)
+	}
+	if !bytes.Equal(decrypted, originalData) {
+		t.Fatalf("Decrypted data mismatch: got %s, want %s", string(decrypted), string(originalData))
+	}
 }

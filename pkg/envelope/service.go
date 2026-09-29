@@ -18,6 +18,7 @@ import (
 type KMSAPI interface {
 	GenerateDataKey(ctx context.Context, params *kms.GenerateDataKeyInput, optFns ...func(*kms.Options)) (*kms.GenerateDataKeyOutput, error)
 	Decrypt(ctx context.Context, params *kms.DecryptInput, optFns ...func(*kms.Options)) (*kms.DecryptOutput, error)
+	ReEncrypt(ctx context.Context, params *kms.ReEncryptInput, optFns ...func(*kms.Options)) (*kms.ReEncryptOutput, error)
 }
 
 // Service manages the envelope encryption lifecycle: asking KMS for wrapped data keys,
@@ -33,6 +34,16 @@ func NewService(kmsClient KMSAPI, kmsKeyID string) *Service {
 		kmsClient: kmsClient,
 		kmsKeyID:  kmsKeyID,
 	}
+}
+
+// KMSKeyID returns the currently active KMS master key identifier.
+func (s *Service) KMSKeyID() string {
+	return s.kmsKeyID
+}
+
+// SetKMSKeyID updates the active KMS master key identifier (e.g. after key rotation or migration).
+func (s *Service) SetKMSKeyID(newKeyID string) {
+	s.kmsKeyID = newKeyID
 }
 
 // WrapAndEncrypt implements the upload envelope encryption workflow:
@@ -128,6 +139,55 @@ func (s *Service) DecryptAndUnwrap(ctx context.Context, env *EncryptedEnvelope) 
 	}
 
 	return plaintext, nil
+}
+
+// ReWrapEnvelope re-encrypts the wrapped data key under a new KMS master key or new key version
+// using the KMS ReEncrypt API. The plaintext data key never leaves the KMS Hardware Security Module (HSM).
+func (s *Service) ReWrapEnvelope(ctx context.Context, env *EncryptedEnvelope, newKMSKeyID string) (*EncryptedEnvelope, error) {
+	if env == nil || len(env.EncryptedDataKey) == 0 {
+		return nil, ErrInvalidEnvelope
+	}
+	if newKMSKeyID == "" {
+		newKMSKeyID = s.kmsKeyID
+	}
+
+	sourceKeyID := env.KMSKeyID
+	if sourceKeyID == "" {
+		sourceKeyID = s.kmsKeyID
+	}
+
+	reInput := &kms.ReEncryptInput{
+		CiphertextBlob:   env.EncryptedDataKey,
+		SourceKeyId:      aws.String(sourceKeyID),
+		DestinationKeyId: aws.String(newKMSKeyID),
+		SourceEncryptionContext: map[string]string{
+			"object_id": env.ObjectID,
+		},
+		DestinationEncryptionContext: map[string]string{
+			"object_id": env.ObjectID,
+		},
+	}
+
+	reOut, err := s.kmsClient.ReEncrypt(ctx, reInput)
+	if err != nil {
+		return nil, s.mapKMSError(err)
+	}
+
+	destKeyID := newKMSKeyID
+	if reOut.KeyId != nil {
+		destKeyID = *reOut.KeyId
+	}
+
+	return &EncryptedEnvelope{
+		ObjectID:         env.ObjectID,
+		S3Key:            env.S3Key,
+		Ciphertext:       env.Ciphertext,
+		IV:               env.IV,
+		AuthTag:          env.AuthTag,
+		EncryptedDataKey: reOut.CiphertextBlob,
+		KMSKeyID:         destKeyID,
+		CreatedAt:        env.CreatedAt,
+	}, nil
 }
 
 // mapKMSError classifies AWS KMS errors into explicit domain errors (e.g. AccessDenied vs ContextMismatch).

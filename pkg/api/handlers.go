@@ -26,6 +26,11 @@ type ErrorResponse struct {
 	Code  string `json:"code"`
 }
 
+// ReWrapRequest represents the payload for rotating a key on an existing object.
+type ReWrapRequest struct {
+	NewKMSKeyID string `json:"new_kms_key_id"`
+}
+
 // DeleteResponse represents a successful deletion response.
 type DeleteResponse struct {
 	Status   string `json:"status"`
@@ -208,6 +213,40 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		Status:   "deleted",
 		ObjectID: objectID,
 	})
+}
+
+// ReWrap handles POST /objects/{id}/rewrap and POST /api/v1/objects/{id}/rewrap.
+func (h *Handler) ReWrap(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		h.writeError(w, errors.New("method not allowed"), http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED")
+		return
+	}
+
+	objectID := extractObjectID(r.URL.Path)
+	if objectID == "" {
+		h.writeError(w, errors.New("missing object ID in URL path"), http.StatusBadRequest, "MISSING_OBJECT_ID")
+		return
+	}
+
+	var req ReWrapRequest
+	if r.Body != nil && r.ContentLength > 0 {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	targetKey := req.NewKMSKeyID
+	if targetKey == "" {
+		targetKey = r.URL.Query().Get("key_id")
+	}
+
+	result, err := h.gateway.ReWrap(r.Context(), objectID, targetKey)
+	if err != nil {
+		h.handleServiceError(w, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(result)
 }
 
 // Health handles GET /health and GET /api/v1/health.

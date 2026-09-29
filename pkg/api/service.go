@@ -38,6 +38,16 @@ type DownloadMetadata struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// ReWrapResponse contains the results of a server-side KMS envelope re-encryption operation.
+type ReWrapResponse struct {
+	ObjectID       string    `json:"object_id"`
+	S3Key          string    `json:"s3_key"`
+	OldKMSKeyID    string    `json:"old_kms_key_id"`
+	NewKMSKeyID    string    `json:"new_kms_key_id"`
+	CiphertextSize int       `json:"ciphertext_size"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
 // HealthResponse represents the health status of the gateway and its connected backends.
 type HealthResponse struct {
 	Status    string            `json:"status"`
@@ -135,6 +145,55 @@ func (s *GatewayService) Delete(ctx context.Context, objectID string) error {
 // Head checks object existence and returns ciphertext size.
 func (s *GatewayService) Head(ctx context.Context, objectID string) (int64, error) {
 	return s.storage.HeadEncryptedObject(ctx, objectID)
+}
+
+// ReWrap rotates the encrypted envelope key for an existing object under a new KMS master key
+// or key version. The file content in S3 is NEVER downloaded, decrypted, or re-uploaded.
+func (s *GatewayService) ReWrap(ctx context.Context, objectID string, targetKMSKeyID string) (*ReWrapResponse, error) {
+	if objectID == "" {
+		return nil, fmt.Errorf("%w: objectID cannot be empty", envelope.ErrInvalidEnvelope)
+	}
+
+	// 1. Fetch current envelope from S3
+	oldEnv, err := s.storage.GetEncryptedObject(ctx, objectID)
+	if err != nil {
+		return nil, err
+	}
+
+	oldKeyID := oldEnv.KMSKeyID
+	if targetKMSKeyID == "" {
+		targetKMSKeyID = s.envService.KMSKeyID()
+	}
+
+	// 2. Re-encrypt the data key using KMS ReEncrypt API (pure KMS HSM operation)
+	newEnv, err := s.envService.ReWrapEnvelope(ctx, oldEnv, targetKMSKeyID)
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. Update the S3 metadata headers in-place (no payload copy)
+	if err := s.storage.UpdateEnvelopeMetadata(ctx, newEnv); err != nil {
+		return nil, err
+	}
+
+	return &ReWrapResponse{
+		ObjectID:       newEnv.ObjectID,
+		S3Key:          newEnv.S3Key,
+		OldKMSKeyID:    oldKeyID,
+		NewKMSKeyID:    newEnv.KMSKeyID,
+		CiphertextSize: len(oldEnv.Ciphertext),
+		UpdatedAt:      time.Now().UTC(),
+	}, nil
+}
+
+// RotateMasterKey updates the active KMS master key used for new encryption operations.
+func (s *GatewayService) RotateMasterKey(newKMSKeyID string) {
+	s.envService.SetKMSKeyID(newKMSKeyID)
+}
+
+// ActiveKMSKeyID returns the currently active KMS master key ID.
+func (s *GatewayService) ActiveKMSKeyID() string {
+	return s.envService.KMSKeyID()
 }
 
 // CheckHealth checks connectivity to S3 and returns system status.

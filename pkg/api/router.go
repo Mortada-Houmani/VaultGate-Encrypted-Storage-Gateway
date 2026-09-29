@@ -64,8 +64,17 @@ func NewRouter(handler *Handler) http.Handler {
 	return recoveryMiddleware(corsMiddleware(loggerMiddleware(mux)))
 }
 
-// dispatchObjectRoutes routes GET, HEAD, DELETE requests for /objects/{id}.
+// dispatchObjectRoutes routes GET, HEAD, DELETE requests for /objects/{id} and POST /objects/{id}/rewrap.
 func dispatchObjectRoutes(handler *Handler, w http.ResponseWriter, r *http.Request) {
+	if strings.HasSuffix(r.URL.Path, "/rewrap") {
+		if r.Method == http.MethodPost {
+			handler.ReWrap(w, r)
+		} else {
+			http.Error(w, `{"error":"method not allowed","code":"METHOD_NOT_ALLOWED"}`, http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
 		handler.Download(w, r)
