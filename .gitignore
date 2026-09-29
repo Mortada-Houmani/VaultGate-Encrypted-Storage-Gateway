@@ -1,5 +1,8 @@
 # Binaries
 bin/
+/vaultgate
+/gateway
+
 *.exe
 *.exe~
 *.dll
