@@ -1,11 +1,16 @@
-.PHONY: help build test test-race lint localstack-up localstack-down tf-init tf-plan tf-apply tf-destroy clean
+.PHONY: help build build-cli build-all run demo test test-race lint localstack-up localstack-down tf-init tf-plan tf-apply tf-destroy clean
 
 APP_NAME = vaultgate
+CLI_NAME = vaultgate-cli
 BIN_DIR = bin
 
 help:
 	@echo "VaultGate Development Commands:"
 	@echo "  make build            - Build gateway binary"
+	@echo "  make build-cli        - Build CLI verification tool"
+	@echo "  make build-all        - Build both gateway and CLI binaries"
+	@echo "  make run              - Run the gateway locally"
+	@echo "  make demo             - Run automated security demonstration"
 	@echo "  make test             - Run unit tests"
 	@echo "  make test-race        - Run unit tests with race detector"
 	@echo "  make localstack-up    - Start LocalStack in background"
@@ -18,6 +23,18 @@ help:
 build:
 	@mkdir -p $(BIN_DIR)
 	go build -v -o $(BIN_DIR)/$(APP_NAME) ./cmd/gateway
+
+build-cli:
+	@mkdir -p $(BIN_DIR)
+	go build -v -o $(BIN_DIR)/$(CLI_NAME) ./cmd/cli
+
+build-all: build build-cli
+
+run: build
+	./$(BIN_DIR)/$(APP_NAME)
+
+demo: build-cli
+	./$(BIN_DIR)/$(CLI_NAME) demo
 
 test:
 	go test -v ./...
